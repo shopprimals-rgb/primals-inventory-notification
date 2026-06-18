@@ -54,6 +54,21 @@ CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "43200"))
 
 STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
+# Non-product line items to skip entirely (matched in name OR sku,
+# case-insensitive substring). Comma-separated; override via env if you want.
+EXCLUDE_KEYWORDS = [
+    w.strip().lower()
+    for w in os.environ.get("EXCLUDE_KEYWORDS", "shipping fee,fee,guide").split(",")
+    if w.strip()
+]
+
+
+def is_excluded(product):
+    """True if this product looks like a non-physical line item to skip."""
+    name = (product.get("name") or "").lower()
+    sku = (product.get("sku") or "").lower()
+    return any(kw in name or kw in sku for kw in EXCLUDE_KEYWORDS)
+
 API_BASE = "https://api.warehance.com/v1"
 
 URGENCY_RANK = {"critical": 3, "high": 2, "medium": 1, "ok": 0}
@@ -159,13 +174,51 @@ def build_embed(product, urgency, days_of_supply, now_dt):
 # ----------------------------------------------------------------------
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 
 
 @client.event
 async def on_ready():
     log.info(f"Logged in as {client.user} (bot is now ONLINE in your server)")
+    try:
+        await tree.sync()
+        log.info("Slash commands synced (/total available)")
+    except Exception as exc:
+        log.warning(f"Failed to sync slash commands: {exc}")
     if not check_inventory.is_running():
         check_inventory.start()
+
+
+@tree.command(name="total", description="Total quantity across all products (excludes shipping/fees/guides)")
+async def total_command(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        products = fetch_all_products()
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't reach Warehance: {exc}")
+        return
+
+    total_available = 0
+    total_on_hand = 0
+    counted = 0
+    for p in products:
+        if is_excluded(p):
+            continue
+        total_available += p.get("available") or 0
+        total_on_hand += p.get("on_hand") or 0
+        counted += 1
+
+    now_dt = datetime.now(timezone.utc)
+    embed = discord.Embed(
+        title="\U0001F4E6 Total Inventory",
+        description=f"Across **{counted:,}** products (shipping/fees/guides excluded)",
+        color=0x3D8B37,
+        timestamp=now_dt,
+    )
+    embed.add_field(name="Total available", value=f"{total_available:,}", inline=True)
+    embed.add_field(name="Total on hand", value=f"{total_on_hand:,}", inline=True)
+    embed.set_footer(text="Warehance reorder monitor")
+    await interaction.followup.send(embed=embed)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
@@ -196,6 +249,8 @@ async def check_inventory():
         sku = p.get("sku")
         if not sku:
             continue
+        if is_excluded(p):
+            continue  # non-product line item (shipping fee, guide, etc.)
         available = p.get("available") or 0
         units = _sales_for_window(p)
         velocity = units / VELOCITY_WINDOW_DAYS if VELOCITY_WINDOW_DAYS else 0
