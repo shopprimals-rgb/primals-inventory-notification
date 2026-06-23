@@ -18,13 +18,15 @@ State is stored in a small JSON file so it only pings on tier CHANGE.
 """
 
 import os
-import json
 import logging
 from datetime import datetime, timezone
 
 import requests
 import discord
 from discord.ext import tasks
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger("warehance-bot")
 
 # ----------------------------------------------------------------------
 # CONFIG (environment variables; defaults shown)
@@ -39,51 +41,44 @@ HIGH_AT = int(os.environ.get("HIGH_AT", "100"))
 MEDIUM_AT = int(os.environ.get("MEDIUM_AT", "200"))
 
 # How often to check, in seconds (default 12 hours)
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "43200"))
+# How often to post the full inventory roundup, in seconds (default 8 hours)
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "28800"))
 
-STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
-# Non-product line items to skip (substring match on name OR sku, case-insensitive)
-EXCLUDE_KEYWORDS = [
-    w.strip().lower()
-    for w in os.environ.get("EXCLUDE_KEYWORDS", "shipping fee,fee,guide").split(",")
-    if w.strip()
-]
+# SKU allowlist: only these products get alerts. Loaded from skus.txt
+# (one SKU per line; blank lines and #comments ignored). Stored lowercase
+# for case-insensitive matching.
+ALLOWLIST_FILE = os.environ.get("ALLOWLIST_FILE", "skus.txt")
+
+
+def load_allowlist():
+    allowed = set()
+    try:
+        with open(ALLOWLIST_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                allowed.add(line.lower())
+    except FileNotFoundError:
+        log.warning("Allowlist file '%s' not found - no products will alert.", ALLOWLIST_FILE)
+    return allowed
+
+
+ALLOWED_SKUS = load_allowlist()
+
+
+def is_allowed(product):
+    """True only if this product's SKU is on the allowlist."""
+    sku = (product.get("sku") or "").strip().lower()
+    return sku in ALLOWED_SKUS
 
 API_BASE = "https://api.warehance.com/v1"
 PAGE_LIMIT = 100  # max allowed by Warehance /products
 
-URGENCY_RANK = {"critical": 3, "high": 2, "medium": 1, "ok": 0}
 URGENCY_COLOR = {"critical": 0xE03131, "high": 0xF08C00, "medium": 0xF7B500}
 URGENCY_ICON = {"critical": "\U0001F534", "high": "\U0001F7E0", "medium": "\U0001F7E1"}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-log = logging.getLogger("warehance-bot")
-
-
-# ----------------------------------------------------------------------
-# State (only ping on tier CHANGE)
-# ----------------------------------------------------------------------
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-
-# ----------------------------------------------------------------------
-# Exclude non-product line items
-# ----------------------------------------------------------------------
-def is_excluded(product):
-    name = (product.get("name") or "").lower()
-    sku = (product.get("sku") or "").lower()
-    return any(kw in name or kw in sku for kw in EXCLUDE_KEYWORDS)
 
 
 # ----------------------------------------------------------------------
@@ -130,33 +125,49 @@ def compute_urgency(on_hand):
 
 
 # ----------------------------------------------------------------------
-# Discord embed (one per product)
+# Compact inventory table (shared by roundup + /inventory + /lowstock)
 # ----------------------------------------------------------------------
-def build_embed(product, urgency, now_dt):
-    name = product.get("name", "Unknown")
-    sku = product.get("sku") or "\u2014"
-    on_hand = product.get("on_hand") or 0
-    available = product.get("available") or 0
-    allocated = product.get("allocated") or 0
+def allowed_products(products):
+    """Filter to allowlisted products, sorted lowest on-hand first."""
+    rows = [p for p in products if is_allowed(p)]
+    rows.sort(key=lambda p: p.get("on_hand") or 0)
+    return rows
 
-    embed = discord.Embed(
-        title=f"{URGENCY_ICON.get(urgency,'\U0001F7E1')} {urgency.upper()} \u00b7 {name}",
-        description=f"**Notification:** {now_dt.strftime('%b %d, %Y at %I:%M %p UTC')}",
-        color=URGENCY_COLOR.get(urgency, 0xF7B500),
-        timestamp=now_dt,
-    )
-    embed.add_field(name="SKU", value=f"`{sku}`", inline=True)
-    embed.add_field(name="On hand", value=f"{on_hand:,}", inline=True)
-    embed.add_field(name="Urgency", value=urgency.upper(), inline=True)
-    embed.add_field(name="Available", value=f"{available:,}", inline=True)
-    embed.add_field(name="Allocated", value=f"{allocated:,}", inline=True)
-    embed.add_field(
-        name="Tiers",
-        value=f"Crit \u2264{CRITICAL_AT} \u00b7 High \u2264{HIGH_AT} \u00b7 Med \u2264{MEDIUM_AT}",
-        inline=True,
-    )
-    embed.set_footer(text="Warehance low-stock monitor")
-    return embed
+
+def _row_line(product):
+    on_hand = product.get("on_hand") or 0
+    urgency = compute_urgency(on_hand)
+    icon = URGENCY_ICON.get(urgency, "\u2705")  # green check = healthy
+    name = (product.get("name") or "Unknown")[:34]
+    return f"{icon} {on_hand:>6,}  {name}"
+
+
+def build_table_blocks(rows, header):
+    """
+    Build one or more Discord messages (each <2000 chars) containing a
+    monospace table. Returns a list of message strings.
+    """
+    legend = f"\U0001F534\u2264{CRITICAL_AT}  \U0001F7E0\u2264{HIGH_AT}  \U0001F7E1\u2264{MEDIUM_AT}  \u2705 ok"
+    lines = [_row_line(p) for p in rows]
+
+    messages = []
+    chunk = []
+    chunk_len = 0
+    for line in lines:
+        if chunk_len + len(line) + 1 > 1800:  # leave room for code fences
+            messages.append("```\n" + "\n".join(chunk) + "\n```")
+            chunk, chunk_len = [], 0
+        chunk.append(line)
+        chunk_len += len(line) + 1
+    if chunk:
+        messages.append("```\n" + "\n".join(chunk) + "\n```")
+
+    if not messages:
+        messages = ["```\n(no products)\n```"]
+
+    # Prepend header + legend to the first message
+    messages[0] = f"**{header}**\n{legend}\n" + messages[0]
+    return messages
 
 
 # ----------------------------------------------------------------------
@@ -172,7 +183,7 @@ async def on_ready():
     log.info(f"Logged in as {client.user} (bot is now ONLINE in your server)")
     try:
         await tree.sync()
-        log.info("Slash commands synced (/total available)")
+        log.info("Slash commands synced (/total, /inventory, /lowstock)")
     except Exception as exc:
         log.warning(f"Failed to sync slash commands: {exc}")
     if not check_inventory.is_running():
@@ -192,7 +203,7 @@ async def total_command(interaction: discord.Interaction):
     total_available = 0
     counted = 0
     for p in products:
-        if is_excluded(p):
+        if not is_allowed(p):
             continue
         total_on_hand += p.get("on_hand") or 0
         total_available += p.get("available") or 0
@@ -209,6 +220,49 @@ async def total_command(interaction: discord.Interaction):
     embed.add_field(name="Total available", value=f"{total_available:,}", inline=True)
     embed.set_footer(text="Warehance low-stock monitor")
     await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="inventory", description="Full inventory list with on-hand counts (low items flagged)")
+async def inventory_command(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        products = fetch_all_products()
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't reach Warehance: {exc}")
+        return
+
+    rows = allowed_products(products)
+    low = sum(1 for p in rows if compute_urgency(p.get("on_hand") or 0) != "ok")
+    header = f"\U0001F4E6 Current Inventory \u2014 {len(rows)} products, {low} running low"
+
+    msgs = build_table_blocks(rows, header)
+    await interaction.followup.send(msgs[0])
+    for extra in msgs[1:]:
+        await interaction.followup.send(extra)
+
+
+@tree.command(name="lowstock", description="Show only the products currently running low (Critical/High/Medium)")
+async def lowstock_command(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        products = fetch_all_products()
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't reach Warehance: {exc}")
+        return
+
+    rows = [
+        p for p in allowed_products(products)
+        if compute_urgency(p.get("on_hand") or 0) != "ok"
+    ]
+    if not rows:
+        await interaction.followup.send("\u2705 **All good** — no products are running low right now.")
+        return
+
+    header = f"\u26a0\ufe0f Running Low — {len(rows)} product(s)"
+    msgs = build_table_blocks(rows, header)
+    await interaction.followup.send(msgs[0])
+    for extra in msgs[1:]:
+        await interaction.followup.send(extra)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
@@ -230,36 +284,21 @@ async def check_inventory():
 
     log.info("Fetched %d products from Warehance", len(products))
 
-    prev = load_state()
-    new_state = {}
+    rows = allowed_products(products)
     now_dt = datetime.now(timezone.utc)
-    to_send = []
+    low = sum(1 for p in rows if compute_urgency(p.get("on_hand") or 0) != "ok")
+    header = (
+        f"\U0001F4E6 Inventory Roundup \u00b7 {now_dt.strftime('%b %d, %Y %I:%M %p UTC')}"
+        f"  \u2014  {len(rows)} products, {low} running low"
+    )
 
-    for p in products:
-        sku = p.get("sku")
-        if not sku:
-            continue
-        if is_excluded(p):
-            continue
-        on_hand = p.get("on_hand") or 0
-        urgency = compute_urgency(on_hand)
-        if urgency == "ok":
-            continue
-
-        new_state[sku] = urgency
-        if prev.get(sku) != urgency:  # only on tier CHANGE
-            to_send.append((urgency, p))
-
-    to_send.sort(key=lambda x: -URGENCY_RANK.get(x[0], 0))
-
-    for urgency, p in to_send:
+    for msg in build_table_blocks(rows, header):
         try:
-            await channel.send(embed=build_embed(p, urgency, now_dt))
+            await channel.send(msg)
         except Exception as exc:
-            log.warning(f"Failed to send alert for {p.get('sku')}: {exc}")
+            log.warning(f"Failed to send roundup message: {exc}")
 
-    save_state(new_state)
-    log.info("Posted %d changed alert(s) to Discord", len(to_send))
+    log.info("Posted inventory roundup (%d products, %d low)", len(rows), low)
 
 
 @check_inventory.before_loop
@@ -269,7 +308,7 @@ async def before_check():
 
 if __name__ == "__main__":
     log.info(
-        "Starting Warehance low-stock bot | tiers: crit<=%d high<=%d med<=%d | interval=%ds",
+        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds",
         CRITICAL_AT, HIGH_AT, MEDIUM_AT, CHECK_INTERVAL_SECONDS,
     )
     client.run(DISCORD_BOT_TOKEN)
