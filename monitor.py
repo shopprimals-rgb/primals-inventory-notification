@@ -134,11 +134,62 @@ def allowed_products(products):
     return rows
 
 
+SIZE_TOKENS = ["XXL", "XL", "Small", "Medium", "Large", "S", "M", "L"]
+
+
+def _find_size(name):
+    """Return the size token present in the name, if any (e.g. 'Small', 'XL')."""
+    import re
+    for tok in SIZE_TOKENS:
+        # match as a whole word, case-insensitive
+        if re.search(rf"(?<![A-Za-z]){re.escape(tok)}(?![A-Za-z])", name, re.IGNORECASE):
+            return tok
+    return None
+
+
+def _short_name(raw, width=40):
+    """
+    Trim a product name to ~`width` chars while ALWAYS preserving the size
+    (Small/Medium/Large/XL/XXL) wherever it appears. Strips 'PRIMALS' prefix.
+    e.g. 'PRIMALS Merino Wool Boxer Brief - Small / Midnight Black'
+      -> 'Merino Wool Boxer Brief (Small)'
+    """
+    name = (raw or "Unknown").strip()
+    if name.upper().startswith("PRIMALS"):
+        name = name[len("PRIMALS"):].strip()
+
+    size = _find_size(name)
+
+    if len(name) <= width:
+        return name
+
+    if size:
+        # Strip the size (and surrounding separators) out of the base, then
+        # re-append it in parentheses so it's always visible and consistent.
+        import re
+        base = re.sub(
+            rf"\s*[-/]?\s*(?<![A-Za-z]){re.escape(size)}(?![A-Za-z])\s*[-/]?\s*",
+            " ",
+            name,
+            flags=re.IGNORECASE,
+        ).strip()
+        # also drop a trailing/leading colour like "Midnight Black" leftovers' extra spaces
+        base = re.sub(r"\s{2,}", " ", base)
+        suffix = f" ({size})"
+        keep = width - len(suffix)
+        if len(base) > keep:
+            base = base[: keep - 1].rstrip() + "\u2026"
+        return base + suffix
+
+    # No size: just truncate with an ellipsis
+    return name[: width - 1].rstrip() + "\u2026"
+
+
 def _row_line(product):
     on_hand = product.get("on_hand") or 0
     urgency = compute_urgency(on_hand)
     icon = URGENCY_ICON.get(urgency, "\u2705")  # green check = healthy
-    name = (product.get("name") or "Unknown")[:34]
+    name = _short_name(product.get("name"))
     return f"{icon} {on_hand:>6,}  {name}"
 
 
@@ -183,7 +234,7 @@ async def on_ready():
     log.info(f"Logged in as {client.user} (bot is now ONLINE in your server)")
     try:
         await tree.sync()
-        log.info("Slash commands synced (/total, /inventory, /lowstock)")
+        log.info("Slash commands synced (/inventory, /lowstock, /total, /commands)")
     except Exception as exc:
         log.warning(f"Failed to sync slash commands: {exc}")
     if not check_inventory.is_running():
@@ -263,6 +314,51 @@ async def lowstock_command(interaction: discord.Interaction):
     await interaction.followup.send(msgs[0])
     for extra in msgs[1:]:
         await interaction.followup.send(extra)
+
+
+@tree.command(name="commands", description="List all available commands")
+async def commands_command(interaction: discord.Interaction):
+    now_dt = datetime.now(timezone.utc)
+    embed = discord.Embed(
+        title="\U0001F4CB Available Commands",
+        color=0x3D8B37,
+        timestamp=now_dt,
+    )
+    embed.add_field(
+        name="/inventory",
+        value="Full inventory list with on-hand counts (low items flagged).",
+        inline=False,
+    )
+    embed.add_field(
+        name="/lowstock",
+        value="Only the products currently running low (Critical / High / Medium).",
+        inline=False,
+    )
+    embed.add_field(
+        name="/total",
+        value="Total on-hand + available across all tracked products.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/commands",
+        value="Show this list of commands.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Automatic roundup",
+        value=f"A full inventory roundup posts automatically every "
+              f"{CHECK_INTERVAL_SECONDS // 3600} hours.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Stock tiers",
+        value=f"\U0001F534 Critical \u2264{CRITICAL_AT}  \u00b7  "
+              f"\U0001F7E0 High \u2264{HIGH_AT}  \u00b7  "
+              f"\U0001F7E1 Medium \u2264{MEDIUM_AT}",
+        inline=False,
+    )
+    embed.set_footer(text="Warehance inventory monitor")
+    await interaction.response.send_message(embed=embed)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
