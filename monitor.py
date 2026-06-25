@@ -18,6 +18,7 @@ State is stored in a small JSON file so it only pings on tier CHANGE.
 """
 
 import os
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -79,6 +80,11 @@ PAGE_LIMIT = 100  # max allowed by Warehance
 # Warehouse to report on (matches the Inventory Value Report). Default = 1251 E Walnut St.
 WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", "231185184003").strip()
 
+# How often to poll inbound shipments, in seconds (default 15 min) for prompt
+# "new shipment" alerts. Separate from the 4-hour stock roundup.
+INBOUND_POLL_SECONDS = int(os.environ.get("INBOUND_POLL_SECONDS", "900"))
+INBOUND_STATE_FILE = os.environ.get("INBOUND_STATE_FILE", "inbound_state.json")
+
 URGENCY_COLOR = {"critical": 0xE03131, "high": 0xF08C00, "medium": 0xF7B500}
 URGENCY_ICON = {"critical": "\U0001F534", "high": "\U0001F7E0", "medium": "\U0001F7E1"}
 
@@ -136,6 +142,133 @@ def fetch_all_products():
             break
 
     return list(by_sku.values())
+
+
+# ----------------------------------------------------------------------
+# Inbound shipments: fetch, state, and alert formatting
+# ----------------------------------------------------------------------
+def fetch_inbound_shipments():
+    """
+    Pull all inbound shipments for the configured warehouse. Returns a list of
+    shipment dicts (raw from Warehance), each with id, reference_number, items[],
+    closed, etc.
+    """
+    headers = {"X-API-KEY": WAREHANCE_API_KEY, "accept": "application/json"}
+    cursor = None
+    shipments = []
+
+    while True:
+        params = {"limit": PAGE_LIMIT}
+        if WAREHOUSE_ID:
+            params["warehouse_id"] = WAREHOUSE_ID
+        if cursor:
+            params["cursor"] = cursor
+
+        resp = requests.get(f"{API_BASE}/inbound-shipments", headers=headers, params=params, timeout=30)
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Warehance {resp.status_code} on /inbound-shipments: {resp.text[:300]}"
+            )
+
+        data = resp.json().get("data", {}) or {}
+        batch = data.get("inbound_shipments", []) or []
+
+        for s in batch:
+            wh = (s.get("warehouse") or {}).get("id")
+            if WAREHOUSE_ID and wh and str(wh) != str(WAREHOUSE_ID):
+                continue
+            shipments.append(s)
+
+        if data.get("has_next_page") and data.get("next_cursor"):
+            cursor = data["next_cursor"]
+        else:
+            break
+
+    return shipments
+
+
+def load_inbound_state():
+    """State: {'seen': [ids], 'received': [ids]} -- shipments already announced."""
+    try:
+        with open(INBOUND_STATE_FILE) as f:
+            data = json.load(f)
+            return {"seen": set(data.get("seen", [])),
+                    "received": set(data.get("received", []))}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"seen": set(), "received": set()}
+
+
+def save_inbound_state(state):
+    with open(INBOUND_STATE_FILE, "w") as f:
+        json.dump({"seen": sorted(state["seen"]),
+                   "received": sorted(state["received"])}, f)
+
+
+def is_received(shipment):
+    """A shipment counts as received if it's closed OR every item's received >= ordered."""
+    if shipment.get("closed"):
+        return True
+    items = shipment.get("items") or []
+    if not items:
+        return False
+    return all((it.get("received") or 0) >= (it.get("ordered") or 0) for it in items)
+
+
+def _inbound_lines(shipment, kind):
+    """
+    Build per-item lines + totals for an inbound alert.
+    - created: 'Item   Ordered'
+    - received: 'Item   Recv / Ord'  (side by side so over/under deliveries show)
+    """
+    items = shipment.get("items") or []
+    lines = []
+    total_main = 0   # ordered (created) or received (received)
+    total_ord = 0
+    for it in items:
+        prod = it.get("product") or {}
+        name = short_name(prod.get("name"))
+        ordered = it.get("ordered") or 0
+        received = it.get("received") or 0
+        total_ord += ordered
+        if kind == "created":
+            total_main += ordered
+            lines.append(f"{name:<22} {ordered:>8,}")
+        else:
+            total_main += received
+            lines.append(f"{name:<22} {received:>7,} / {ordered:<7,}")
+    return lines, total_main, total_ord
+
+
+def build_inbound_embed(shipment, kind):
+    """kind = 'created' or 'received'."""
+    now_dt = datetime.now(timezone.utc)
+    ref = shipment.get("reference_number") or f"Shipment {shipment.get('id')}"
+    lines, total_main, total_ord = _inbound_lines(shipment, kind)
+
+    if kind == "created":
+        title = "\U0001F4E6 New Inbound Shipment"
+        color = 0x3D8B37
+        header = f"{'Item':<22} {'Ordered':>8}"
+    else:
+        title = "\u2705 Inbound Shipment Received"
+        color = 0x1F8B4C
+        header = f"{'Item':<22} {'Recv':>7} / {'Ord':<7}"
+
+    table = header + "\n" + "\n".join(lines)
+    embed = discord.Embed(
+        title=title,
+        description=f"**{ref}**\n```\n{table}\n```",
+        color=color,
+        timestamp=now_dt,
+    )
+    if kind == "received":
+        embed.add_field(name="Total received", value=f"{total_main:,}", inline=True)
+        embed.add_field(name="Total ordered", value=f"{total_ord:,}", inline=True)
+    else:
+        embed.add_field(name="Total units", value=f"{total_main:,}", inline=True)
+    embed.add_field(name="Products", value=f"{len(lines)}", inline=True)
+    embed.set_footer(text="Warehance inbound monitor")
+    return embed
 
 
 # ----------------------------------------------------------------------
@@ -295,6 +428,8 @@ async def on_ready():
         log.warning(f"Failed to sync slash commands: {exc}")
     if not check_inventory.is_running():
         check_inventory.start()
+    if not check_inbound.is_running():
+        check_inbound.start()
 
 
 @tree.command(name="total", description="Total on-hand + available across all products (excludes shipping/fees/guides)")
@@ -340,7 +475,7 @@ async def inventory_command(interaction: discord.Interaction):
 
     rows = allowed_products(products)
     low = sum(1 for p in rows if compute_urgency(p.get("on_hand") or 0) != "ok")
-    header = f"\U0001F4E6 Current Inventory \u2014 {len(rows)} products, {low} running low"
+    header = f"\U0001F4CA Current Inventory - {len(rows)} products, {low} running low"
 
     msgs = build_table_blocks(rows, header)
     await interaction.followup.send(msgs[0])
@@ -440,8 +575,8 @@ async def check_inventory():
     now_dt = datetime.now(timezone.utc)
     low = sum(1 for p in rows if compute_urgency(p.get("on_hand") or 0) != "ok")
     header = (
-        f"\U0001F4E6 Inventory Roundup \u00b7 {now_dt.strftime('%b %d, %Y %I:%M %p UTC')}"
-        f"  \u2014  {len(rows)} products, {low} running low"
+        f"\U0001F4CA Inventory Count \u00b7 {now_dt.strftime('%b %d, %Y %I:%M %p UTC')}"
+        f"  -  {len(rows)} products, {low} running low"
     )
 
     for msg in build_table_blocks(rows, header):
@@ -458,9 +593,76 @@ async def before_check():
     await client.wait_until_ready()
 
 
+@tasks.loop(seconds=INBOUND_POLL_SECONDS)
+async def check_inbound():
+    channel = client.get_channel(DISCORD_CHANNEL_ID)
+    if channel is None:
+        log.error("Channel %s not found for inbound alerts.", DISCORD_CHANNEL_ID)
+        return
+
+    try:
+        shipments = fetch_inbound_shipments()
+    except Exception as exc:
+        log.error(f"Inbound fetch failed: {exc}")
+        return
+
+    state = load_inbound_state()
+    first_run = not state["seen"] and not state["received"]
+
+    if first_run:
+        # Baseline: record all existing shipments WITHOUT alerting, so we don't
+        # dump dozens of "new shipment" messages on first boot. Mark already-
+        # received ones too.
+        for s in shipments:
+            sid = s.get("id")
+            if sid is None:
+                continue
+            state["seen"].add(sid)
+            if is_received(s):
+                state["received"].add(sid)
+        save_inbound_state(state)
+        log.info("Inbound baseline recorded: %d existing shipments (no alerts).", len(shipments))
+        return
+
+    new_created = 0
+    new_received = 0
+
+    for s in shipments:
+        sid = s.get("id")
+        if sid is None:
+            continue
+
+        # NEW shipment -> created alert
+        if sid not in state["seen"]:
+            state["seen"].add(sid)
+            try:
+                await channel.send(embed=build_inbound_embed(s, "created"))
+                new_created += 1
+            except Exception as exc:
+                log.warning(f"Failed to send created alert for {sid}: {exc}")
+
+        # RECEIVED -> received alert (once)
+        if sid not in state["received"] and is_received(s):
+            state["received"].add(sid)
+            try:
+                await channel.send(embed=build_inbound_embed(s, "received"))
+                new_received += 1
+            except Exception as exc:
+                log.warning(f"Failed to send received alert for {sid}: {exc}")
+
+    save_inbound_state(state)
+    if new_created or new_received:
+        log.info("Inbound alerts posted: %d new, %d received", new_created, new_received)
+
+
+@check_inbound.before_loop
+async def before_inbound():
+    await client.wait_until_ready()
+
+
 if __name__ == "__main__":
     log.info(
-        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds",
-        CRITICAL_AT, HIGH_AT, MEDIUM_AT, CHECK_INTERVAL_SECONDS,
+        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds | inbound poll %ds",
+        CRITICAL_AT, HIGH_AT, MEDIUM_AT, CHECK_INTERVAL_SECONDS, INBOUND_POLL_SECONDS,
     )
     client.run(DISCORD_BOT_TOKEN)
