@@ -320,7 +320,10 @@ def build_inbound_detail_block(shipment):
     return head + "\n" + "\n".join(lines) + "\n" + foot
 
 
-
+# ----------------------------------------------------------------------
+# Stock-tier urgency
+# ----------------------------------------------------------------------
+def compute_urgency(on_hand):
     if on_hand <= CRITICAL_AT:
         return "critical"
     if on_hand <= HIGH_AT:
