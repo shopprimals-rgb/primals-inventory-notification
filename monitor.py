@@ -294,9 +294,13 @@ def build_inbound_detail_block(shipment):
     ref = shipment.get("reference_number") or f"Shipment {shipment.get('id')}"
     added = _fmt_date(shipment.get("created_at"))
     received_date = _fmt_date(shipment.get("closed_date"))
-    closed = bool(shipment.get("closed"))
-    status_icon = "\u2705" if closed else "\U0001F69A"  # check if closed, truck if in transit
-    status_txt = "Received" if closed else "In transit"
+    # Status purely by quantity: received >= ordered for every item = fully received.
+    items_for_status = shipment.get("items") or []
+    fully_received = bool(items_for_status) and all(
+        (it.get("received") or 0) >= (it.get("ordered") or 0) for it in items_for_status
+    )
+    status_icon = "\u2705" if fully_received else "\U0001F6A7"  # check if received, barrier if not yet
+    status_txt = "Received" if fully_received else "Not yet"
 
     items = shipment.get("items") or []
     lines = []
@@ -622,10 +626,14 @@ async def inbound_command(interaction: discord.Interaction):
     # Newest first by created_at
     shipments.sort(key=lambda s: s.get("created_at") or "", reverse=True)
 
-    open_count = sum(1 for s in shipments if not s.get("closed"))
-    header = (f"\U0001F69A Inbound Shipments - {len(shipments)} total, "
-              f"{open_count} in transit\n"
-              f"\U0001F69A in transit  \u2705 received")
+    def _fully_received(s):
+        its = s.get("items") or []
+        return bool(its) and all((it.get("received") or 0) >= (it.get("ordered") or 0) for it in its)
+
+    not_yet = sum(1 for s in shipments if not _fully_received(s))
+    header = (f"\U0001F4E6 Inbound Shipments - {len(shipments)} total, "
+              f"{not_yet} not yet received\n"
+              f"\U0001F6A7 not yet  \u2705 received")
 
     blocks = [build_inbound_detail_block(s) for s in shipments]
 
