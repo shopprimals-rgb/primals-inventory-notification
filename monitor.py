@@ -271,10 +271,56 @@ def build_inbound_embed(shipment, kind):
     return embed
 
 
-# ----------------------------------------------------------------------
-# Stock-tier urgency
-# ----------------------------------------------------------------------
-def compute_urgency(on_hand):
+def _fmt_date(iso):
+    """Format an ISO timestamp as 'Jun 17, 2026'. Returns '-' for missing/placeholder."""
+    if not iso:
+        return "-"
+    # Warehance uses '0001-01-01T...' as a placeholder for 'no date'
+    if iso.startswith("0001"):
+        return "-"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y")
+    except (ValueError, AttributeError):
+        return "-"
+
+
+def build_inbound_detail_block(shipment):
+    """
+    One shipment as a full-detail text block for /inbound:
+    name, added/received dates, status, every product with Recv/Ord, totals.
+    Returns a string (may be combined with others, then split into messages).
+    """
+    ref = shipment.get("reference_number") or f"Shipment {shipment.get('id')}"
+    added = _fmt_date(shipment.get("created_at"))
+    received_date = _fmt_date(shipment.get("closed_date"))
+    closed = bool(shipment.get("closed"))
+    status_icon = "\u2705" if closed else "\U0001F69A"  # check if closed, truck if in transit
+    status_txt = "Received" if closed else "In transit"
+
+    items = shipment.get("items") or []
+    lines = []
+    total_recv = 0
+    total_ord = 0
+    for it in items:
+        prod = it.get("product") or {}
+        name = short_name(prod.get("name"))
+        ordered = it.get("ordered") or 0
+        received = it.get("received") or 0
+        total_recv += received
+        total_ord += ordered
+        lines.append(f"  {name:<22} {received:>7,} / {ordered:<7,}")
+
+    head = (
+        f"{status_icon} {ref}\n"
+        f"   Status: {status_txt}  |  Added: {added}  |  Received: {received_date}\n"
+        f"   {'Item':<22} {'Recv':>7} / {'Ord':<7}"
+    )
+    foot = f"   Total: {total_recv:,} received / {total_ord:,} ordered  ({len(lines)} product(s))"
+    return head + "\n" + "\n".join(lines) + "\n" + foot
+
+
+
     if on_hand <= CRITICAL_AT:
         return "critical"
     if on_hand <= HIGH_AT:
@@ -423,7 +469,7 @@ async def on_ready():
     log.info(f"Logged in as {client.user} (bot is now ONLINE in your server)")
     try:
         await tree.sync()
-        log.info("Slash commands synced (/inventory, /lowstock, /total, /commands)")
+        log.info("Slash commands synced (/inventory, /lowstock, /inbound, /total, /commands)")
     except Exception as exc:
         log.warning(f"Failed to sync slash commands: {exc}")
     if not check_inventory.is_running():
@@ -526,6 +572,11 @@ async def commands_command(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="/inbound",
+        value="All inbound shipments with products, quantities (received/ordered), and dates.",
+        inline=False,
+    )
+    embed.add_field(
         name="/total",
         value="Total on-hand + available across all tracked products.",
         inline=False,
@@ -550,6 +601,49 @@ async def commands_command(interaction: discord.Interaction):
     )
     embed.set_footer(text="Warehance inventory monitor")
     await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="inbound", description="List all inbound shipments with products, quantities, and dates")
+async def inbound_command(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        shipments = fetch_inbound_shipments()
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't reach Warehance: {exc}")
+        return
+
+    if not shipments:
+        await interaction.followup.send("No inbound shipments found.")
+        return
+
+    # Newest first by created_at
+    shipments.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+
+    open_count = sum(1 for s in shipments if not s.get("closed"))
+    header = (f"\U0001F69A Inbound Shipments - {len(shipments)} total, "
+              f"{open_count} in transit\n"
+              f"\U0001F69A in transit  \u2705 received")
+
+    blocks = [build_inbound_detail_block(s) for s in shipments]
+
+    # Pack blocks into Discord messages under 2000 chars, each wrapped in a code fence
+    messages = []
+    chunk = []
+    chunk_len = 0
+    for b in blocks:
+        # +8 for code fences and newlines
+        if chunk_len + len(b) + 8 > 1850 and chunk:
+            messages.append("```\n" + "\n\n".join(chunk) + "\n```")
+            chunk, chunk_len = [], 0
+        chunk.append(b)
+        chunk_len += len(b) + 2
+    if chunk:
+        messages.append("```\n" + "\n\n".join(chunk) + "\n```")
+
+    # First message carries the header
+    await interaction.followup.send(header + "\n" + messages[0])
+    for extra in messages[1:]:
+        await interaction.followup.send(extra)
 
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
