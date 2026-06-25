@@ -106,10 +106,10 @@ def fetch_all_products():
         if cursor:
             params["cursor"] = cursor
 
-        resp = requests.get(f"{API_BASE}/inventory", headers=headers, params=params, timeout=30)
+        resp = requests.get(f"{API_BASE}/inventory-locations", headers=headers, params=params, timeout=30)
         if resp.status_code >= 400:
             raise RuntimeError(
-                f"Warehance {resp.status_code} on /inventory: {resp.text[:300]}"
+                f"Warehance {resp.status_code} on /inventory-locations: {resp.text[:300]}"
             )
 
         data = resp.json().get("data", {}) or {}
