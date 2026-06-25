@@ -41,8 +41,8 @@ HIGH_AT = int(os.environ.get("HIGH_AT", "100"))
 MEDIUM_AT = int(os.environ.get("MEDIUM_AT", "200"))
 
 # How often to check, in seconds (default 12 hours)
-# How often to post the full inventory roundup, in seconds (default 8 hours)
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "28800"))
+# How often to post the full inventory roundup, in seconds (default 4 hours)
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "14400"))
 
 
 # SKU allowlist: only these products get alerts. Loaded from skus.txt
@@ -135,88 +135,140 @@ def allowed_products(products):
 
 
 SIZE_TOKENS = ["XXL", "XL", "Small", "Medium", "Large", "S", "M", "L"]
+SIZE_ABBR = {"small": "S", "medium": "M", "large": "L", "xl": "XL", "xxl": "XXL",
+             "s": "S", "m": "M", "l": "L"}
 
 
 def _find_size(name):
     """Return the size token present in the name, if any (e.g. 'Small', 'XL')."""
     import re
     for tok in SIZE_TOKENS:
-        # match as a whole word, case-insensitive
         if re.search(rf"(?<![A-Za-z]){re.escape(tok)}(?![A-Za-z])", name, re.IGNORECASE):
             return tok
     return None
 
 
-def _short_name(raw, width=40):
+def _drop_vowels(word):
+    """Remove vowels from a word (keep first letter), for last-resort shortening."""
+    if len(word) <= 3:
+        return word
+    return word[0] + "".join(c for c in word[1:] if c.lower() not in "aeiou")
+
+
+def short_name(raw, width=20):
     """
-    Trim a product name to ~`width` chars while ALWAYS preserving the size
-    (Small/Medium/Large/XL/XXL) wherever it appears. Strips 'PRIMALS' prefix.
-    e.g. 'PRIMALS Merino Wool Boxer Brief - Small / Midnight Black'
-      -> 'Merino Wool Boxer Brief (Small)'
+    Make a SHORT readable label (default <=20 chars) for table rows.
+    - strips 'PRIMALS'
+    - keeps the first distinctive words + size, e.g. 'Hair-Strengthening'
+    - appends size abbreviation if present: 'Organic Cotton (S)'
+    - drops vowels as a last resort if still too long
     """
+    import re
     name = (raw or "Unknown").strip()
     if name.upper().startswith("PRIMALS"):
         name = name[len("PRIMALS"):].strip()
 
     size = _find_size(name)
+    size_abbr = SIZE_ABBR.get(size.lower(), size) if size else None
 
-    if len(name) <= width:
-        return name
+    # Drop colour/variant noise after a dash/slash and parentheticals
+    core = re.split(r"[/(]", name)[0].strip()
+    # keep hyphenated words together (Hair-Strengthening, Fluoride-Free)
+    words = core.replace(" - ", " ").split()
 
-    if size:
-        # Strip the size (and surrounding separators) out of the base, then
-        # re-append it in parentheses so it's always visible and consistent.
-        import re
-        base = re.sub(
-            rf"\s*[-/]?\s*(?<![A-Za-z]){re.escape(size)}(?![A-Za-z])\s*[-/]?\s*",
-            " ",
-            name,
-            flags=re.IGNORECASE,
-        ).strip()
-        # also drop a trailing/leading colour like "Midnight Black" leftovers' extra spaces
-        base = re.sub(r"\s{2,}", " ", base)
-        suffix = f" ({size})"
-        keep = width - len(suffix)
-        if len(base) > keep:
-            base = base[: keep - 1].rstrip() + "\u2026"
-        return base + suffix
+    suffix = f" ({size_abbr})" if size_abbr else ""
+    avail = width - len(suffix)
 
-    # No size: just truncate with an ellipsis
-    return name[: width - 1].rstrip() + "\u2026"
+    # Add words until we'd exceed the available width
+    label = ""
+    for w in words:
+        candidate = (label + " " + w).strip()
+        if len(candidate) > avail:
+            break
+        label = candidate
+    if not label:  # first word alone too long
+        label = words[0] if words else core
+
+    label = (label + suffix).strip()
+
+    if len(label) > width:
+        base = " ".join(_drop_vowels(w) for w in label.replace(suffix, "").split())
+        label = (base + suffix).strip()
+
+    return label[:width]
 
 
-def _row_line(product):
-    on_hand = product.get("on_hand") or 0
-    urgency = compute_urgency(on_hand)
-    icon = URGENCY_ICON.get(urgency, "\u2705")  # green check = healthy
-    name = _short_name(product.get("name"))
-    return f"{icon} {on_hand:>6,}  {name}"
+# ----------------------------------------------------------------------
+# 5-column spreadsheet-style table (shared by roundup + commands)
+# Columns: Item | OnHand | Alloc | Avail | Back | Resv
+# ----------------------------------------------------------------------
+def _num_field(product, *keys):
+    """Return the first present numeric field among `keys` (handles API naming variants)."""
+    for k in keys:
+        v = product.get(k)
+        if v is not None:
+            return v
+    return 0
+
+
+def _fields(product):
+    return {
+        "on_hand": _num_field(product, "on_hand", "onhand", "quantity_on_hand"),
+        "allocated": _num_field(product, "allocated", "allocated_quantity"),
+        "available": _num_field(product, "available", "available_quantity"),
+        "backordered": _num_field(product, "backordered", "backorder", "backordered_quantity"),
+        "reserved": _num_field(product, "reserved", "reserved_quantity"),
+    }
+
+
+# Column widths
+_W_NAME = 20
+_W_NUM = 7
+
+
+def _table_header():
+    return (
+        f"{'Item':<{_W_NAME}} {'OnHand':>{_W_NUM}} {'Alloc':>{_W_NUM}} "
+        f"{'Avail':>{_W_NUM}} {'Back':>{_W_NUM}} {'Resv':>{_W_NUM}}"
+    )
+
+
+def _table_row(product):
+    f = _fields(product)
+    urgency = compute_urgency(f["on_hand"])
+    icon = URGENCY_ICON.get(urgency, "\u2705")
+    name = short_name(product.get("name"))
+    return (
+        f"{name:<{_W_NAME}} {f['on_hand']:>{_W_NUM},} {f['allocated']:>{_W_NUM},} "
+        f"{f['available']:>{_W_NUM},} {f['backordered']:>{_W_NUM},} {f['reserved']:>{_W_NUM},} {icon}"
+    )
 
 
 def build_table_blocks(rows, header):
     """
     Build one or more Discord messages (each <2000 chars) containing a
-    monospace table. Returns a list of message strings.
+    monospace 5-column spreadsheet-style table. Returns a list of strings.
     """
     legend = f"\U0001F534\u2264{CRITICAL_AT}  \U0001F7E0\u2264{HIGH_AT}  \U0001F7E1\u2264{MEDIUM_AT}  \u2705 ok"
-    lines = [_row_line(p) for p in rows]
+    col_head = _table_header()
+    body_lines = [_table_row(p) for p in rows]
 
     messages = []
-    chunk = []
-    chunk_len = 0
-    for line in lines:
-        if chunk_len + len(line) + 1 > 1800:  # leave room for code fences
+    chunk = [col_head]
+    chunk_len = len(col_head) + 1
+    for line in body_lines:
+        if chunk_len + len(line) + 1 > 1800:
             messages.append("```\n" + "\n".join(chunk) + "\n```")
-            chunk, chunk_len = [], 0
+            chunk = [col_head]
+            chunk_len = len(col_head) + 1
         chunk.append(line)
         chunk_len += len(line) + 1
-    if chunk:
+    if len(chunk) > 1:
         messages.append("```\n" + "\n".join(chunk) + "\n```")
 
     if not messages:
         messages = ["```\n(no products)\n```"]
 
-    # Prepend header + legend to the first message
     messages[0] = f"**{header}**\n{legend}\n" + messages[0]
     return messages
 
@@ -273,7 +325,7 @@ async def total_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="inventory", description="Full inventory list with on-hand counts (low items flagged)")
+@tree.command(name="inventory", description="Full inventory: on-hand, allocated, available, backordered, reserved")
 async def inventory_command(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     try:
@@ -326,7 +378,7 @@ async def commands_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="/inventory",
-        value="Full inventory list with on-hand counts (low items flagged).",
+        value="Full 5-column inventory (on-hand, allocated, available, backordered, reserved).",
         inline=False,
     )
     embed.add_field(
