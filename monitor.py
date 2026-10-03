@@ -341,9 +341,9 @@ def compute_urgency(on_hand):
 # Compact inventory table (shared by roundup + /inventory + /lowstock)
 # ----------------------------------------------------------------------
 def allowed_products(products):
-    """Filter to allowlisted products, sorted lowest on-hand first."""
+    """Filter to allowlisted products, sorted lowest available first."""
     rows = [p for p in products if is_allowed(p)]
-    rows.sort(key=lambda p: p.get("on_hand") or 0)
+    rows.sort(key=lambda p: p.get("available") or 0)
     return rows
 
 
@@ -417,21 +417,26 @@ def short_name(raw, width=20):
 # ----------------------------------------------------------------------
 
 # Column widths
-_W_NAME = 22
-_W_NUM = 8
+_W_NAME = 20
+_W_NUM = 7
 
 
 def _table_header():
-    return f"{'Item':<{_W_NAME}} {'OnHand':>{_W_NUM}} {'Avail':>{_W_NUM}}"
+    return (f"{'Item':<{_W_NAME}} {'OnHand':>{_W_NUM}} "
+            f"{'Alloc':>{_W_NUM}} {'Avail':>{_W_NUM}}")
 
 
 def _table_row(product):
     on_hand = product.get("on_hand") or 0
     available = product.get("available") or 0
-    urgency = compute_urgency(on_hand)
+    allocated = on_hand - available  # Warehance: allocated = on_hand - available
+    if allocated < 0:
+        allocated = 0
+    urgency = compute_urgency(available)  # tiers based on AVAILABLE stock
     icon = URGENCY_ICON.get(urgency, "\u2705")
     name = short_name(product.get("name"))
-    return f"{name:<{_W_NAME}} {on_hand:>{_W_NUM},} {available:>{_W_NUM},} {icon}"
+    return (f"{name:<{_W_NAME}} {on_hand:>{_W_NUM},} "
+            f"{allocated:>{_W_NUM},} {available:>{_W_NUM},} {icon}")
 
 
 def build_table_blocks(rows, header):
@@ -527,7 +532,7 @@ async def inventory_command(interaction: discord.Interaction):
         return
 
     rows = allowed_products(products)
-    low = sum(1 for p in rows if compute_urgency(p.get("on_hand") or 0) != "ok")
+    low = sum(1 for p in rows if compute_urgency(p.get("available") or 0) != "ok")
     header = f"\U0001F4CA Current Inventory - {len(rows)} products, {low} running low"
 
     msgs = build_table_blocks(rows, header)
@@ -547,7 +552,7 @@ async def lowstock_command(interaction: discord.Interaction):
 
     rows = [
         p for p in allowed_products(products)
-        if compute_urgency(p.get("on_hand") or 0) != "ok"
+        if compute_urgency(p.get("available") or 0) != "ok"
     ]
     if not rows:
         await interaction.followup.send("\u2705 **All good** - no products are running low right now.")
@@ -678,7 +683,7 @@ async def check_inventory():
 
     rows = allowed_products(products)
     now_dt = datetime.now(timezone.utc)
-    low = sum(1 for p in rows if compute_urgency(p.get("on_hand") or 0) != "ok")
+    low = sum(1 for p in rows if compute_urgency(p.get("available") or 0) != "ok")
     header = (
         f"\U0001F4CA Inventory Count \u00b7 {now_dt.strftime('%b %d, %Y %I:%M %p UTC')}"
         f"  -  {len(rows)} products, {low} running low"
