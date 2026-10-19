@@ -20,6 +20,8 @@ State is stored in a small JSON file so it only pings on tier CHANGE.
 import os
 import json
 import logging
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 
 import requests
@@ -84,6 +86,15 @@ WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", "231185184003").strip()
 # "new shipment" alerts. Separate from the 4-hour stock roundup.
 INBOUND_POLL_SECONDS = int(os.environ.get("INBOUND_POLL_SECONDS", "900"))
 INBOUND_STATE_FILE = os.environ.get("INBOUND_STATE_FILE", "inbound_state.json")
+
+# Email alert when an inbound shipment is marked received in Warehance, via
+# Gmail SMTP. Rides the inbound poll loop, so it fires automatically within one
+# poll of the 3PL marking it received. Leave GMAIL_* / RECEIVED_EMAIL_TO unset
+# to disable email entirely (Discord keeps working).
+GMAIL_USER = os.environ.get("GMAIL_USER", "").strip()            # the sending Gmail address
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").strip()  # 16-char app password
+RECEIVED_EMAIL_TO = os.environ.get("RECEIVED_EMAIL_TO", "").strip()   # recipient(s), comma-separated
+EMAIL_ENABLED = bool(GMAIL_USER and GMAIL_APP_PASSWORD and RECEIVED_EMAIL_TO)
 
 URGENCY_COLOR = {"critical": 0xE03131, "high": 0xF08C00, "medium": 0xF7B500}
 URGENCY_ICON = {"critical": "\U0001F534", "high": "\U0001F7E0", "medium": "\U0001F7E1"}
@@ -185,6 +196,43 @@ def fetch_inbound_shipments():
             break
 
     return shipments
+
+
+def send_received_email(shipment):
+    """Send one Gmail SMTP email when an inbound shipment is marked received."""
+    ref = shipment.get("reference_number") or f"Shipment {shipment.get('id')}"
+    items = shipment.get("items") or []
+
+    lines = []
+    total_recv = 0
+    total_ord = 0
+    for it in items:
+        prod = it.get("product") or {}
+        pname = (prod.get("name") or "Unknown").strip()
+        sku = prod.get("sku") or "-"
+        ordered = it.get("ordered") or 0
+        received = it.get("received") or 0
+        total_recv += received
+        total_ord += ordered
+        lines.append(f"  {pname} ({sku}): {received:,} received / {ordered:,} ordered")
+
+    body = (
+        f"Inbound shipment received at 1251 E Walnut St.\n\n"
+        f"Shipment: {ref}\n\n"
+        f"Products:\n" + "\n".join(lines) + "\n\n"
+        f"Total: {total_recv:,} received / {total_ord:,} ordered "
+        f"({len(lines)} product(s))\n"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Shipment received: {ref}"
+    msg["From"] = GMAIL_USER
+    msg["To"] = RECEIVED_EMAIL_TO
+    msg.set_content(body)
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
 
 
 def load_inbound_state():
@@ -751,7 +799,7 @@ async def check_inbound():
             except Exception as exc:
                 log.warning(f"Failed to send created alert for {sid}: {exc}")
 
-        # RECEIVED -> received alert (once)
+        # RECEIVED -> Discord alert + email (once per shipment)
         if sid not in state["received"] and is_received(s):
             state["received"].add(sid)
             try:
@@ -759,6 +807,11 @@ async def check_inbound():
                 new_received += 1
             except Exception as exc:
                 log.warning(f"Failed to send received alert for {sid}: {exc}")
+            if EMAIL_ENABLED:
+                try:
+                    send_received_email(s)
+                except Exception as exc:
+                    log.warning(f"Failed to email received alert for {sid}: {exc}")
 
     save_inbound_state(state)
     if new_created or new_received:
@@ -772,7 +825,8 @@ async def before_inbound():
 
 if __name__ == "__main__":
     log.info(
-        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds | inbound poll %ds",
+        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds | inbound poll %ds | received email: %s",
         CRITICAL_AT, HIGH_AT, MEDIUM_AT, CHECK_INTERVAL_SECONDS, INBOUND_POLL_SECONDS,
+        "on" if EMAIL_ENABLED else "off",
     )
     client.run(DISCORD_BOT_TOKEN)
