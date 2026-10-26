@@ -96,6 +96,17 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").strip()  # 16-char
 RECEIVED_EMAIL_TO = os.environ.get("RECEIVED_EMAIL_TO", "").strip()   # recipient(s), comma-separated
 EMAIL_ENABLED = bool(GMAIL_USER and GMAIL_APP_PASSWORD and RECEIVED_EMAIL_TO)
 
+# Slack alerts (in addition to Discord). One incoming-webhook URL; all three
+# Slack messages go to its channel. Leave SLACK_WEBHOOK_URL unset to disable.
+#   - low-stock report: available drops to <= SLACK_LOW_AT (default 100)
+#   - out-of-stock report: available hits 0
+#   - total inventory count: posted once every SLACK_TOTAL_EVERY_SECONDS (default 24h)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+SLACK_LOW_AT = int(os.environ.get("SLACK_LOW_AT", "100"))
+SLACK_TOTAL_EVERY_SECONDS = int(os.environ.get("SLACK_TOTAL_EVERY_SECONDS", "86400"))
+SLACK_STATE_FILE = os.environ.get("SLACK_STATE_FILE", "slack_state.json")
+SLACK_ENABLED = bool(SLACK_WEBHOOK_URL)
+
 URGENCY_COLOR = {"critical": 0xE03131, "high": 0xF08C00, "medium": 0xF7B500}
 URGENCY_ICON = {"critical": "\U0001F534", "high": "\U0001F7E0", "medium": "\U0001F7E1"}
 
@@ -393,6 +404,35 @@ def allowed_products(products):
     rows = [p for p in products if is_allowed(p)]
     rows.sort(key=lambda p: p.get("available") or 0)
     return rows
+
+
+# ----------------------------------------------------------------------
+# Slack (incoming webhook) -- low-stock, out-of-stock, daily total
+# ----------------------------------------------------------------------
+def post_to_slack(text):
+    """Post a plain-text message to the Slack incoming webhook."""
+    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Slack {resp.status_code}: {resp.text[:200]}")
+
+
+def load_slack_state():
+    """State: which SKUs are currently flagged low / out, and last daily-total time."""
+    try:
+        with open(SLACK_STATE_FILE) as f:
+            d = json.load(f)
+            return {"low": set(d.get("low", [])),
+                    "out": set(d.get("out", [])),
+                    "last_total": d.get("last_total", 0)}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"low": set(), "out": set(), "last_total": 0}
+
+
+def save_slack_state(state):
+    with open(SLACK_STATE_FILE, "w") as f:
+        json.dump({"low": sorted(state["low"]),
+                   "out": sorted(state["out"]),
+                   "last_total": state["last_total"]}, f)
 
 
 SIZE_TOKENS = ["XXL", "XL", "Small", "Medium", "Large", "S", "M", "L"]
@@ -745,6 +785,70 @@ async def check_inventory():
 
     log.info("Posted inventory roundup (%d products, %d low)", len(rows), low)
 
+    # ---- Slack alerts (in addition to Discord) ----
+    if SLACK_ENABLED:
+        state = load_slack_state()
+        new_low = set()
+        new_out = set()
+        posted = 0
+
+        for p in rows:
+            sku = p.get("sku")
+            if not sku:
+                continue
+            available = p.get("available") or 0
+            name = short_name(p.get("name"))
+
+            if available <= 0:
+                new_out.add(sku)
+                if sku not in state["out"]:  # newly out of stock
+                    try:
+                        post_to_slack(
+                            f":red_circle: *Out of stock* - {name} (`{sku}`) "
+                            f"is at 0 available. Reorder needed."
+                        )
+                        posted += 1
+                    except Exception as exc:
+                        log.warning(f"Slack out-of-stock post failed for {sku}: {exc}")
+                        new_out.discard(sku)  # retry next cycle
+            elif available <= SLACK_LOW_AT:
+                new_low.add(sku)
+                if sku not in state["low"]:  # newly low
+                    try:
+                        post_to_slack(
+                            f":large_orange_diamond: *Low stock* - {name} (`{sku}`) "
+                            f"dropped to {available:,} available (threshold {SLACK_LOW_AT})."
+                        )
+                        posted += 1
+                    except Exception as exc:
+                        log.warning(f"Slack low-stock post failed for {sku}: {exc}")
+                        new_low.discard(sku)  # retry next cycle
+            # products above the low threshold are carried into neither set,
+            # which re-arms them for a future drop.
+
+        # Daily total inventory count
+        now_ts = now_dt.timestamp()
+        last_total = state.get("last_total", 0)
+        if now_ts - last_total >= SLACK_TOTAL_EVERY_SECONDS:
+            total_on_hand = sum(p.get("on_hand") or 0 for p in rows)
+            total_avail = sum(p.get("available") or 0 for p in rows)
+            try:
+                post_to_slack(
+                    f":bar_chart: *Daily inventory count* ({len(rows)} products)\n"
+                    f"Total on hand: {total_on_hand:,}\n"
+                    f"Total available: {total_avail:,}\n"
+                    f"Running low (<= {SLACK_LOW_AT} avail): {low}"
+                )
+                last_total = now_ts
+                posted += 1
+            except Exception as exc:
+                log.warning(f"Slack daily-total post failed: {exc}")
+
+        state["low"], state["out"], state["last_total"] = new_low, new_out, last_total
+        save_slack_state(state)
+        if posted:
+            log.info("Posted %d Slack message(s)", posted)
+
 
 @check_inventory.before_loop
 async def before_check():
@@ -825,8 +929,9 @@ async def before_inbound():
 
 if __name__ == "__main__":
     log.info(
-        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds | inbound poll %ds | received email: %s",
+        "Starting Warehance inventory bot | tiers: crit<=%d high<=%d med<=%d | roundup every %ds | inbound poll %ds | received email: %s | slack: %s",
         CRITICAL_AT, HIGH_AT, MEDIUM_AT, CHECK_INTERVAL_SECONDS, INBOUND_POLL_SECONDS,
         "on" if EMAIL_ENABLED else "off",
+        ("on (low<=%d, daily total)" % SLACK_LOW_AT) if SLACK_ENABLED else "off",
     )
     client.run(DISCORD_BOT_TOKEN)
