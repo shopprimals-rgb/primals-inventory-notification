@@ -449,6 +449,33 @@ def post_to_slack(text):
         raise RuntimeError(f"Slack {resp.status_code}: {resp.text[:200]}")
 
 
+def build_slack_count(rows, title):
+    """
+    Build the Slack inventory-count message with a per-product breakdown
+    (one line per SKU: name, on-hand, available) plus totals at the end.
+    `rows` is already allowlisted + sorted (lowest available first).
+    """
+    total_on_hand = sum(p.get("on_hand") or 0 for p in rows)
+    total_avail = sum(p.get("available") or 0 for p in rows)
+    low = sum(1 for p in rows if compute_urgency(p.get("available") or 0) != "ok")
+
+    lines = [f"*WAREHANCE INVENTORY*", f":bar_chart: *{title}* ({len(rows)} products)", ""]
+    for p in rows:
+        name = display_name(p)
+        on_hand = p.get("on_hand") or 0
+        available = p.get("available") or 0
+        avail_urg = compute_urgency(available)
+        dot = {"critical": ":red_circle:", "high": ":large_orange_diamond:",
+               "medium": ":large_yellow_circle:"}.get(avail_urg, ":white_check_mark:")
+        lines.append(f"{dot} {name}: {on_hand:,} on hand / {available:,} available")
+
+    lines.append("")
+    lines.append(f"*Total on hand:* {total_on_hand:,}")
+    lines.append(f"*Total available:* {total_avail:,}")
+    lines.append(f"*Running low (<= {SLACK_LOW_AT} avail):* {low}")
+    return "\n".join(lines)
+
+
 def load_slack_state():
     """State: which SKUs are currently flagged low / out, and last daily-total time."""
     try:
@@ -662,16 +689,9 @@ async def slacktotal_command(interaction: discord.Interaction):
     rows = allowed_products(products)
     total_on_hand = sum(p.get("on_hand") or 0 for p in rows)
     total_avail = sum(p.get("available") or 0 for p in rows)
-    low = sum(1 for p in rows if compute_urgency(p.get("available") or 0) != "ok")
 
     try:
-        post_to_slack(
-            f"*WAREHANCE INVENTORY*\n"
-            f":bar_chart: *Inventory count* ({len(rows)} products)\n"
-            f"Total on hand: {total_on_hand:,}\n"
-            f"Total available: {total_avail:,}\n"
-            f"Running low (<= {SLACK_LOW_AT} avail): {low}"
-        )
+        post_to_slack(build_slack_count(rows, "Inventory count"))
     except Exception as exc:
         await interaction.followup.send(f"Couldn't post to Slack: {exc}")
         return
@@ -909,16 +929,8 @@ async def check_inventory():
         now_ts = now_dt.timestamp()
         last_total = state.get("last_total", 0)
         if now_ts - last_total >= SLACK_TOTAL_EVERY_SECONDS:
-            total_on_hand = sum(p.get("on_hand") or 0 for p in rows)
-            total_avail = sum(p.get("available") or 0 for p in rows)
             try:
-                post_to_slack(
-                    f"*WAREHANCE INVENTORY*\n"
-                    f":bar_chart: *Daily inventory count* ({len(rows)} products)\n"
-                    f"Total on hand: {total_on_hand:,}\n"
-                    f"Total available: {total_avail:,}\n"
-                    f"Running low (<= {SLACK_LOW_AT} avail): {low}"
-                )
+                post_to_slack(build_slack_count(rows, "Daily inventory count"))
                 last_total = now_ts
                 posted += 1
             except Exception as exc:
