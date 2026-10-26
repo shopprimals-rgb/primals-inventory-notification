@@ -70,11 +70,44 @@ def load_allowlist():
 
 ALLOWED_SKUS = load_allowlist()
 
+# Custom display names per SKU (SKU = Name), loaded from names.txt. Used in all
+# alerts; a SKU not listed falls back to an auto-generated short name.
+NAMES_FILE = os.environ.get("NAMES_FILE", "names.txt")
+
+
+def load_names():
+    names = {}
+    try:
+        with open(NAMES_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                sku, name = line.split("=", 1)
+                sku = sku.strip().lower()
+                name = name.strip()
+                if sku and name:
+                    names[sku] = name
+    except FileNotFoundError:
+        log.warning("Names file '%s' not found - using auto names.", NAMES_FILE)
+    return names
+
+
+SKU_NAMES = load_names()
+
 
 def is_allowed(product):
     """True only if this product's SKU is on the allowlist."""
     sku = (product.get("sku") or "").strip().lower()
     return sku in ALLOWED_SKUS
+
+
+def display_name(product):
+    """Custom name from names.txt if present, else the auto short name."""
+    sku = (product.get("sku") or "").strip().lower()
+    if sku in SKU_NAMES:
+        return SKU_NAMES[sku]
+    return short_name(product.get("name"))
 
 API_BASE = "https://api.warehance.com/v1"
 PAGE_LIMIT = 100  # max allowed by Warehance
@@ -219,7 +252,7 @@ def send_received_email(shipment):
     total_ord = 0
     for it in items:
         prod = it.get("product") or {}
-        pname = (prod.get("name") or "Unknown").strip()
+        pname = display_name(prod)
         sku = prod.get("sku") or "-"
         ordered = it.get("ordered") or 0
         received = it.get("received") or 0
@@ -285,7 +318,7 @@ def _inbound_lines(shipment, kind):
     total_ord = 0
     for it in items:
         prod = it.get("product") or {}
-        name = short_name(prod.get("name"))
+        name = display_name(prod)
         ordered = it.get("ordered") or 0
         received = it.get("received") or 0
         total_ord += ordered
@@ -367,7 +400,7 @@ def build_inbound_detail_block(shipment):
     total_ord = 0
     for it in items:
         prod = it.get("product") or {}
-        name = short_name(prod.get("name"))
+        name = display_name(prod)
         ordered = it.get("ordered") or 0
         received = it.get("received") or 0
         total_recv += received
@@ -522,7 +555,9 @@ def _table_row(product):
         allocated = 0
     urgency = compute_urgency(available)  # tiers based on AVAILABLE stock
     icon = URGENCY_ICON.get(urgency, "\u2705")
-    name = short_name(product.get("name"))
+    name = display_name(product)
+    if len(name) > _W_NAME:  # keep the fixed-width grid aligned
+        name = name[:_W_NAME - 1] + "\u2026"
     return (f"{name:<{_W_NAME}} {on_hand:>{_W_NUM},} "
             f"{allocated:>{_W_NUM},} {available:>{_W_NUM},} {icon}")
 
@@ -631,6 +666,7 @@ async def slacktotal_command(interaction: discord.Interaction):
 
     try:
         post_to_slack(
+            f"*WAREHANCE INVENTORY*\n"
             f":bar_chart: *Inventory count* ({len(rows)} products)\n"
             f"Total on hand: {total_on_hand:,}\n"
             f"Total available: {total_avail:,}\n"
@@ -838,13 +874,14 @@ async def check_inventory():
             if not sku:
                 continue
             available = p.get("available") or 0
-            name = short_name(p.get("name"))
+            name = display_name(p)
 
             if available <= 0:
                 new_out.add(sku)
                 if sku not in state["out"]:  # newly out of stock
                     try:
                         post_to_slack(
+                            f"*WAREHANCE INVENTORY*\n"
                             f":red_circle: *Out of stock* - {name} (`{sku}`) "
                             f"is at 0 available. Reorder needed."
                         )
@@ -857,6 +894,7 @@ async def check_inventory():
                 if sku not in state["low"]:  # newly low
                     try:
                         post_to_slack(
+                            f"*WAREHANCE INVENTORY*\n"
                             f":large_orange_diamond: *Low stock* - {name} (`{sku}`) "
                             f"dropped to {available:,} available (threshold {SLACK_LOW_AT})."
                         )
@@ -875,6 +913,7 @@ async def check_inventory():
             total_avail = sum(p.get("available") or 0 for p in rows)
             try:
                 post_to_slack(
+                    f"*WAREHANCE INVENTORY*\n"
                     f":bar_chart: *Daily inventory count* ({len(rows)} products)\n"
                     f"Total on hand: {total_on_hand:,}\n"
                     f"Total available: {total_avail:,}\n"
