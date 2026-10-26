@@ -1,0 +1,34 @@
+# PRIMALS SKU display names. Format: SKU = Name (one per line).
+# Blank lines and lines starting with # are ignored.
+# Used in Slack alerts, Discord tables, inbound alerts, and emails.
+# A SKU not listed here falls back to an auto-generated short name.
+
+IW-HZKS-XHJM = Boar Bristle Manual
+B0DWSGGH2F = Horse Bristle Manual
+PE-FHD4-GYEO = Fluoride-Free Toothpaste Tablets
+1J-9JXT-ZFI8 = Copper Tongue Scraper
+B0FT82VWNP = Merino Wool Boxer Brief - S
+B0FT85DKGH = Merino Wool Boxer Brief - M
+B0FT82QJ9R = Merino Wool Boxer Brief - L
+B0FT83YDBK = Merino Wool Boxer Brief - XL
+B0FT83JYBK = Merino Wool Boxer Brief - XXL
+B0DV9BLCSH = Organic Cotton Boxers - S
+B0DV9H1L1N = Organic Cotton Boxers - M
+B0DV9BWBDY = Organic Cotton Boxers - L
+B0DV8TTJ6W = Organic Cotton Boxers - XL
+B0DV9CNY47 = Organic Cotton Boxers - XXL
+4746851850 = Filtered Showerhead 2.0
+4739437235 = Replacement Shower Filter
+PB-W7P8-553Z = Hair-Strengthening Shampoo
+3G-PWVW-XL4I = Body Wash
+4914509155 = Body Lotion
+B0DK3T9BS9 = Blue Light Glasses
+BOARREPLACEMENTHEADSFBM = Boar Replacement Heads
+HORSEREPLACEMENTHEADSFBM = Horse Replacement Heads
+KIDSBOARPRIMALS = Kids Boar
+KIDSHORSEPRIMALS = Kids Horse
+PRIMALSAIRPODPURIFIER = Clean Air Pod
+PRIMALSAIRPODREPLACEMENTFILTER = Air Pod Filter
+PRIMALSFACECREAMBLUEVELVETFBM = Tallow Cream
+PRIMALSHONEYSUCKLECONDITIONERFBM = Conditioner - Emerald Dew
+PRIMALSALPINECITRUSSHOWERSTEAMERFBM = Shower Steamer
