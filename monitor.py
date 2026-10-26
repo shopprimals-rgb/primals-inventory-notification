@@ -569,7 +569,7 @@ async def on_ready():
     log.info(f"Logged in as {client.user} (bot is now ONLINE in your server)")
     try:
         await tree.sync()
-        log.info("Slash commands synced (/inventory, /lowstock, /inbound, /total, /commands)")
+        log.info("Slash commands synced (/inventory, /lowstock, /inbound, /total, /slacktotal, /commands)")
     except Exception as exc:
         log.warning(f"Failed to sync slash commands: {exc}")
     if not check_inventory.is_running():
@@ -608,6 +608,42 @@ async def total_command(interaction: discord.Interaction):
     embed.add_field(name="Total available", value=f"{total_available:,}", inline=True)
     embed.set_footer(text="Warehance low-stock monitor")
     await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="slacktotal", description="Post the current total inventory count to Slack now")
+async def slacktotal_command(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    if not SLACK_ENABLED:
+        await interaction.followup.send(
+            "Slack isn't configured. Set SLACK_WEBHOOK_URL in Railway first."
+        )
+        return
+    try:
+        products = fetch_all_products()
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't reach Warehance: {exc}")
+        return
+
+    rows = allowed_products(products)
+    total_on_hand = sum(p.get("on_hand") or 0 for p in rows)
+    total_avail = sum(p.get("available") or 0 for p in rows)
+    low = sum(1 for p in rows if compute_urgency(p.get("available") or 0) != "ok")
+
+    try:
+        post_to_slack(
+            f":bar_chart: *Inventory count* ({len(rows)} products)\n"
+            f"Total on hand: {total_on_hand:,}\n"
+            f"Total available: {total_avail:,}\n"
+            f"Running low (<= {SLACK_LOW_AT} avail): {low}"
+        )
+    except Exception as exc:
+        await interaction.followup.send(f"Couldn't post to Slack: {exc}")
+        return
+
+    await interaction.followup.send(
+        f"Posted the inventory count to Slack: {len(rows)} products, "
+        f"{total_on_hand:,} on hand, {total_avail:,} available."
+    )
 
 
 @tree.command(name="inventory", description="Full inventory: on-hand and available, per product")
@@ -679,6 +715,11 @@ async def commands_command(interaction: discord.Interaction):
     embed.add_field(
         name="/total",
         value="Total on-hand + available across all tracked products.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/slacktotal",
+        value="Post the current total inventory count to Slack now.",
         inline=False,
     )
     embed.add_field(
